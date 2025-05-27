@@ -1,0 +1,5 @@
+flask==2.3.3
+psycopg2-binary==2.9.7
+requests==2.31.0
+websockets==11.0.3
+redis==4.6.0
