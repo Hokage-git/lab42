@@ -1,4 +1,3 @@
-# discovery_server/discovery_server.py
 import asyncio
 import websockets
 import socket
@@ -9,7 +8,6 @@ import os
 import requests
 from datetime import datetime, timedelta
 
-# Добавляем корневую директорию в путь
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
@@ -25,7 +23,6 @@ class DiscoveryServer:
         self.app = Flask(__name__)
         self.setup_routes()
         
-        # Запускаем фоновую задачу проверки серверов
         self.start_server_health_checker()
         
     def setup_routes(self):
@@ -35,7 +32,6 @@ class DiscoveryServer:
                 data = request.json
                 print(f"Registering server: {data}")
                 
-                # Создаем объект ServerInfo
                 server_info = ServerInfo(
                     server_id=data['server_id'],
                     ip_address=data['ip_address'],
@@ -73,7 +69,6 @@ class DiscoveryServer:
         
         @self.app.route('/debug', methods=['GET'])
         def debug():
-            """Отладочный endpoint"""
             try:
                 with self.db.connection.cursor() as cursor:
                     cursor.execute("SELECT COUNT(*) FROM servers")
@@ -103,7 +98,6 @@ class DiscoveryServer:
         
         @self.app.route('/cleanup', methods=['POST'])
         def cleanup_inactive_servers():
-            """Ручная очистка неактивных серверов"""
             try:
                 updated_count = self.cleanup_dead_servers()
                 return jsonify({
@@ -117,7 +111,6 @@ class DiscoveryServer:
         
         @self.app.route('/status', methods=['GET'])
         def get_discovery_status():
-            """Статус Discovery Server"""
             try:
                 servers = self.db.get_all_servers()
                 active_servers = [s for s in servers if s['status'] == 'active']
@@ -144,7 +137,6 @@ class DiscoveryServer:
                 return jsonify({"error": str(e)}), 500
     
     def check_server_health(self, server):
-        """Проверяет доступность конкретного сервера"""
         try:
             if server['service_type'] == 'file_server':
                 url = f"http://{server['ip_address']}:{server['port']}/status"
@@ -155,7 +147,6 @@ class DiscoveryServer:
                 response = requests.get(url, timeout=3)
                 return response.status_code == 200
             else:
-                # Для других типов серверов просто проверяем TCP подключение
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(3)
                 result = sock.connect_ex((server['ip_address'], server['port']))
@@ -166,7 +157,6 @@ class DiscoveryServer:
             return False
     
     def cleanup_dead_servers(self):
-        """Помечает недоступные серверы как неактивные"""
         servers = self.db.get_all_servers()
         updated_count = 0
         
@@ -174,13 +164,11 @@ class DiscoveryServer:
         
         for server in servers:
             if server['status'] == 'active':
-                # Проверяем heartbeat (старше 60 секунд = подозрительный)
                 last_heartbeat = server.get('last_heartbeat')
                 should_check_health = False
                 
                 if last_heartbeat:
                     if isinstance(last_heartbeat, str):
-                        # Если heartbeat приходит как строка, парсим его
                         try:
                             last_heartbeat = datetime.fromisoformat(last_heartbeat.replace('Z', '+00:00'))
                         except:
@@ -195,7 +183,6 @@ class DiscoveryServer:
                     should_check_health = True
                     print(f"Server {server['server_id']} has no heartbeat")
                 
-                # Если heartbeat старый, проверяем доступность
                 if should_check_health:
                     print(f"Checking health of {server['server_id']} ({server['ip_address']}:{server['port']})")
                     if not self.check_server_health(server):
@@ -209,12 +196,11 @@ class DiscoveryServer:
         return updated_count
     
     def start_server_health_checker(self):
-        """Запускает фоновую задачу проверки серверов"""
         def health_check_worker():
             print("Server health checker started")
             while True:
                 try:
-                    time.sleep(30)  # Проверяем каждые 30 секунд
+                    time.sleep(30) 
                     updated = self.cleanup_dead_servers()
                     if updated > 0:
                         print(f"Health checker: deactivated {updated} servers")
@@ -227,7 +213,6 @@ class DiscoveryServer:
         health_thread.start()
     
     async def websocket_handler(self, websocket, path):
-        """WebSocket для real-time уведомлений"""
         print(f"WebSocket connection from {websocket.remote_address}")
         try:
             async for message in websocket:
@@ -257,7 +242,6 @@ class DiscoveryServer:
             print(f"WebSocket error: {e}")
     
     def start_multicast_listener(self):
-        """UDP Multicast для автоматического обнаружения"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -275,7 +259,6 @@ class DiscoveryServer:
                     
                     if message['type'] == MessageType.DISCOVERY_REQUEST.value:
                         print(f"Discovery request from {addr}")
-                        # Отправляем информацию о Discovery Server
                         response = Protocol.create_message(
                             MessageType.DISCOVERY_RESPONSE,
                             {
@@ -297,12 +280,10 @@ class DiscoveryServer:
         print(f"Multicast: 224.1.1.1:{self.multicast_port}")
         print("=" * 40)
         
-        # Запуск multicast listener в отдельном потоке
         multicast_thread = threading.Thread(target=self.start_multicast_listener)
         multicast_thread.daemon = True
         multicast_thread.start()
         
-        # Запуск WebSocket сервера в отдельном потоке
         def start_websocket():
             try:
                 loop = asyncio.new_event_loop()
@@ -318,7 +299,6 @@ class DiscoveryServer:
         ws_thread.start()
         print(f"WebSocket server started on port {self.ws_port}")
         
-        # Показываем начальную статистику
         try:
             servers = self.db.get_all_servers()
             print(f"Database contains {len(servers)} servers")
@@ -326,8 +306,7 @@ class DiscoveryServer:
             print(f"Active servers: {len(active_servers)}")
         except Exception as e:
             print(f"Database check error: {e}")
-        
-        # Запуск Flask приложения
+
         print(f"Starting HTTP server on port {self.port}")
         print("Available endpoints:")
         print("  GET  /servers - List active servers")

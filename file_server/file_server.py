@@ -1,4 +1,3 @@
-# file_server/file_server.py
 import os
 import hashlib
 import requests
@@ -11,7 +10,6 @@ import uuid
 import sys
 from datetime import datetime
 
-# Добавляем корневую директорию в путь
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared.protocols import Protocol, MessageType, ServerInfo, FileInfo
@@ -21,25 +19,21 @@ class FileServer:
     def __init__(self, server_id=None, port=9000, files_directory=None):
         self.server_id = server_id or str(uuid.uuid4())
         self.port = port
-        # Создаем уникальную директорию для каждого сервера
         self.files_directory = files_directory or f"./server_{port}_files"
         self.discovery_server_url = "http://localhost:8000"
-        self.db = DatabaseManager()  # Подключение к базе данных
+        self.db = DatabaseManager()
         self.app = Flask(__name__)
         
-        # Включаем отладку Flask
         self.app.config['DEBUG'] = False
         
         self.setup_routes()
         
-        # Создаем директорию для файлов
         os.makedirs(self.files_directory, exist_ok=True)
         print(f"Files directory: {os.path.abspath(self.files_directory)}")
         
         self.create_sample_files()
         
     def create_sample_files(self):
-        """Создает тестовые файлы и регистрирует их в БД"""
         print(f"Creating sample files in: {self.files_directory}")
         
         sample_files = {
@@ -72,7 +66,6 @@ class FileServer:
         for filename, content in sample_files.items():
             file_path = os.path.join(self.files_directory, filename)
             try:
-                # Создаем файл если его нет
                 if not os.path.exists(file_path):
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(content)
@@ -81,7 +74,6 @@ class FileServer:
                 else:
                     print(f"- Файл уже существует: {filename}")
                 
-                # Регистрируем файл в базе данных
                 file_size = os.path.getsize(file_path)
                 file_hash = self.calculate_file_hash(file_path)
                 
@@ -91,7 +83,6 @@ class FileServer:
                     file_hash=file_hash,
                     server_id=self.server_id
                 )
-                # Добавляем путь к файлу для базы данных
                 file_info.file_path = file_path
                 
                 self.db.register_file(file_info)
@@ -103,7 +94,6 @@ class FileServer:
         
         print(f"Создано {created_count} новых файлов, зарегистрировано {registered_count} файлов в БД")
         
-        # Показываем итоговую статистику
         if os.path.exists(self.files_directory):
             actual_files = os.listdir(self.files_directory)
             print(f"Всего файлов в директории: {len(actual_files)}")
@@ -120,18 +110,15 @@ class FileServer:
         @self.app.route('/files', methods=['GET'])
         def get_files():
             try:
-                # Сначала пытаемся получить файлы из базы данных
                 files_from_db = self.db.get_files_by_server(self.server_id)
                 
                 if files_from_db:
                     print(f"Retrieved {len(files_from_db)} files from database")
                     return jsonify(files_from_db)
                 else:
-                    # Если в БД нет файлов, возвращаем локальные файлы
                     print("No files in database, scanning local files")
                     files = self.scan_files()
                     
-                    # Попытаемся зарегистрировать файлы в БД
                     try:
                         for file in files:
                             file_info = FileInfo(
@@ -155,7 +142,6 @@ class FileServer:
                     
             except Exception as e:
                 print(f"Error in get_files: {e}")
-                # В случае ошибки БД, возвращаем локальные файлы
                 files = self.scan_files()
                 return jsonify([{
                     'filename': f.filename,
@@ -169,11 +155,9 @@ class FileServer:
         def download_file(filename):
             transfer_id = None
             try:
-                # Логируем начало передачи
                 client_id = request.remote_addr or 'unknown'
                 transfer_id = self.db.log_file_transfer(client_id, filename, self.server_id, 'in_progress')
                 
-                # Проверяем безопасность имени файла
                 if '..' in filename or '/' in filename or '\\' in filename:
                     self.db.update_transfer_status(transfer_id, 'failed')
                     return jsonify({"error": "Invalid filename"}), 400
@@ -187,7 +171,6 @@ class FileServer:
                     print(f"Sending file: {filename}")
                     abs_path = os.path.abspath(file_path)
                     
-                    # Обновляем статус передачи как завершенную
                     self.db.update_transfer_status(transfer_id, 'completed', datetime.now())
                     
                     return send_file(
@@ -200,7 +183,6 @@ class FileServer:
                     print(f"File not found: {file_path}")
                     self.db.update_transfer_status(transfer_id, 'failed')
                     
-                    # Показываем доступные файлы для отладки
                     available_files = os.listdir(self.files_directory) if os.path.exists(self.files_directory) else []
                     print(f"Available files: {available_files}")
                     return jsonify({
@@ -226,7 +208,6 @@ class FileServer:
                 if file.filename == '':
                     return jsonify({"error": "No file selected"}), 400
                 
-                # Проверяем безопасность имени файла
                 filename = file.filename
                 if '..' in filename or '/' in filename or '\\' in filename:
                     return jsonify({"error": "Invalid filename"}), 400
@@ -234,7 +215,6 @@ class FileServer:
                 file_path = os.path.join(self.files_directory, filename)
                 file.save(file_path)
                 
-                # Регистрируем новый файл в БД
                 file_size = os.path.getsize(file_path)
                 file_hash = self.calculate_file_hash(file_path)
                 
@@ -281,7 +261,6 @@ class FileServer:
         
         @self.app.route('/list-files', methods=['GET'])
         def list_files_debug():
-            """Отладочный endpoint для просмотра файлов"""
             try:
                 if not os.path.exists(self.files_directory):
                     return jsonify({
@@ -301,7 +280,6 @@ class FileServer:
                             "hash": self.calculate_file_hash(file_path)
                         })
                 
-                # Также получаем файлы из БД
                 files_in_db = self.db.get_files_by_server(self.server_id)
                 
                 return jsonify({
@@ -316,7 +294,6 @@ class FileServer:
         
         @self.app.route('/transfers', methods=['GET'])
         def get_transfers():
-            """Получает статистику передач файлов для этого сервера"""
             try:
                 with self.db.connection.cursor() as cursor:
                     cursor.execute("""
@@ -347,7 +324,6 @@ class FileServer:
             
         @self.app.route('/sync-db', methods=['POST'])
         def sync_database():
-            """Принудительная синхронизация локальных файлов с БД"""
             try:
                 files = self.scan_files()
                 registered_count = 0
@@ -375,7 +351,6 @@ class FileServer:
                 return jsonify({"error": str(e)}), 500
     
     def scan_files(self) -> List[FileInfo]:
-        """Сканирует директорию и возвращает список файлов"""
         files = []
         if not os.path.exists(self.files_directory):
             return files
@@ -394,7 +369,6 @@ class FileServer:
         return files
     
     def calculate_file_hash(self, file_path: str) -> str:
-        """Вычисляет SHA-256 хеш файла"""
         hash_sha256 = hashlib.sha256()
         try:
             with open(file_path, "rb") as f:
@@ -406,10 +380,7 @@ class FileServer:
             return "error"
     
     def register_with_discovery_server(self):
-        """Регистрируется в Discovery Server через HTTP"""
-        # Получаем локальный IP без маски подсети
         try:
-            # Подключаемся к внешнему адресу для определения локального IP
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             local_ip = s.getsockname()[0]
@@ -441,7 +412,6 @@ class FileServer:
             return False
     
     def send_heartbeat(self):
-        """Отправляет heartbeat через HTTP"""
         while True:
             try:
                 response = requests.post(
@@ -456,10 +426,9 @@ class FileServer:
             except requests.RequestException as e:
                 print(f"Heartbeat error: {e}")
             
-            time.sleep(15)  # Heartbeat каждые 15 секунд
+            time.sleep(15) 
     
     def start_heartbeat(self):
-        """Запускает heartbeat в отдельном потоке"""
         heartbeat_thread = threading.Thread(target=self.send_heartbeat)
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
@@ -473,15 +442,12 @@ class FileServer:
         print(f"Files Directory: {os.path.abspath(self.files_directory)}")
         print("=" * 50)
         
-        # Регистрируемся в Discovery Server
         if self.register_with_discovery_server():
             print(f"✓ File server registered with Discovery Server")
-            # Запускаем heartbeat
             self.start_heartbeat()
         else:
             print("✗ Failed to register with Discovery Server, but continuing...")
         
-        # Показываем информацию о файлах
         files = self.scan_files()
         files_in_db = self.db.get_files_by_server(self.server_id)
         
@@ -506,7 +472,6 @@ class FileServer:
         print("Press Ctrl+C to stop")
         print("=" * 50)
         
-        # Запускаем Flask сервер
         self.app.run(host='0.0.0.0', port=self.port, threaded=True)
 
 if __name__ == "__main__":
