@@ -1,4 +1,3 @@
-# shared/database.py
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
@@ -9,8 +8,8 @@ class DatabaseManager:
         self.connection = psycopg2.connect(
             host='localhost',
             database='distributed_files',
-            user='postgres',  # Замените на ваши данные
-            password='123',  # Замените на ваши данные
+            user='postgres',
+            password='123',
             port=5432
         )
         self.connection.autocommit = True

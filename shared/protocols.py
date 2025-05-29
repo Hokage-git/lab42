@@ -1,4 +1,3 @@
-# shared/protocols.py
 import json
 import time
 from enum import Enum
