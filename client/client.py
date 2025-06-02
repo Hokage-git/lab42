@@ -1,4 +1,3 @@
-# client/client.py
 import requests
 import socket
 import os
@@ -7,12 +6,160 @@ import uuid
 import json
 import time
 import threading
+import asyncio
+import websockets
+import warnings
 from flask import Flask, request, jsonify
 from typing import List
+from datetime import datetime
+
+# Подавляем предупреждения asyncio
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="asyncio")
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared.protocols import Protocol, MessageType, ServerInfo, FileInfo
+
+class WebSocketClient:
+    def __init__(self, client_id: str, discovery_ws_url: str):
+        self.client_id = client_id
+        self.discovery_ws_url = discovery_ws_url
+        self.websocket = None
+        self.room_id = "general"
+        self.connected = False
+        self.chat_history = []
+        self.room_clients = []
+        self.loop = None
+        
+    async def connect(self):
+        try:
+            print(f"Attempting to connect to: {self.discovery_ws_url}")
+            
+            self.websocket = await asyncio.wait_for(
+                websockets.connect(self.discovery_ws_url), 
+                timeout=10
+            )
+            
+            registration = {
+                "client_id": self.client_id,
+                "room_id": self.room_id
+            }
+            await self.websocket.send(json.dumps(registration))
+            
+            response = await asyncio.wait_for(self.websocket.recv(), timeout=5)
+            data = json.loads(response)
+            
+            if data.get('type') == 'registration_confirmed':
+                self.connected = True
+                self.room_clients = data.get('room_clients', [])
+                print(f"Connected to room '{self.room_id}' with {len(self.room_clients)} clients")
+                return True
+            else:
+                print(f"Registration failed: {data}")
+                return False
+                
+        except asyncio.TimeoutError:
+            print("WebSocket connection timeout")
+            return False
+        except ConnectionRefusedError:
+            print("WebSocket connection refused - server may not be running")
+            return False
+        except Exception as e:
+            print(f"WebSocket connection failed: {e}")
+            return False
+    
+    async def listen_messages(self):
+        try:
+            async for message in self.websocket:
+                data = json.loads(message)
+                await self.handle_message(data)
+        except websockets.exceptions.ConnectionClosed:
+            print("WebSocket connection closed")
+            self.connected = False
+        except Exception as e:
+            print(f"Listen error: {e}")
+            self.connected = False
+    
+    async def handle_message(self, data: dict):
+        message_type = data.get('type')
+        
+        if message_type == 'chat_message':
+            sender_id = data.get('sender_id', 'Unknown')
+            message = data.get('message', '')
+            timestamp = datetime.fromtimestamp(data.get('timestamp', time.time()))
+            
+            chat_entry = f"[{timestamp.strftime('%H:%M:%S')}] {sender_id[:8]}...: {message}"
+            self.chat_history.append(chat_entry)
+            print(f"\n{chat_entry}")
+            print(">>> ", end='', flush=True)
+        
+        elif message_type == 'private_message':
+            sender_id = data.get('sender_id', 'Unknown')
+            message = data.get('message', '')
+            timestamp = datetime.fromtimestamp(data.get('timestamp', time.time()))
+            
+            private_entry = f"[{timestamp.strftime('%H:%M:%S')}] PRIVATE from {sender_id[:8]}...: {message}"
+            self.chat_history.append(private_entry)
+            print(f"\n{private_entry}")
+            print(">>> ", end='', flush=True)
+        
+        elif message_type == 'file_available':
+            sender_id = data.get('sender_id', 'Unknown')
+            filename = data.get('filename', '')
+            file_size = data.get('file_size', 0)
+            
+            file_entry = f"FILE SHARED: {filename} ({file_size} bytes) by {sender_id[:8]}..."
+            self.chat_history.append(file_entry)
+            print(f"\n{file_entry}")
+            print(">>> ", end='', flush=True)
+        
+        elif message_type == 'client_joined':
+            client_id = data.get('client_id', 'Unknown')
+            if client_id not in self.room_clients:
+                self.room_clients.append(client_id)
+            print(f"\n{client_id[:8]}... joined the room")
+            print(">>> ", end='', flush=True)
+        
+        elif message_type == 'client_left':
+            client_id = data.get('client_id', 'Unknown')
+            if client_id in self.room_clients:
+                self.room_clients.remove(client_id)
+            print(f"\n{client_id[:8]}... left the room")
+            print(">>> ", end='', flush=True)
+        
+        elif message_type == 'room_clients':
+            self.room_clients = data.get('clients', [])
+    
+    async def send_message(self, message_type: str, data: dict):
+        if self.connected and self.websocket:
+            try:
+                message = {"type": message_type, **data}
+                await self.websocket.send(json.dumps(message))
+                return True
+            except Exception as e:
+                print(f"Send error: {e}")
+                return False
+        return False
+    
+    async def send_chat_message(self, message: str):
+        return await self.send_message('chat_message', {'message': message})
+    
+    async def send_private_message(self, target_id: str, message: str):
+        return await self.send_message('private_message', {
+            'target_id': target_id,
+            'message': message
+        })
+    
+    async def notify_file_share(self, filename: str, file_size: int):
+        return await self.send_message('file_share', {
+            'filename': filename,
+            'file_size': file_size
+        })
+    
+    async def disconnect(self):
+        self.connected = False
+        if self.websocket:
+            await self.websocket.close()
 
 class FileManagerClient:
     def __init__(self):
@@ -51,6 +198,11 @@ class FileManagerClient:
         
         self.test_discovery_connection()
         self.register_with_discovery_server()
+        
+        self.ws_client = None
+        self.ws_task = None
+        self.ws_loop = None
+        self.ws_thread_running = False
         
     def find_free_port(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -151,7 +303,8 @@ class FileManagerClient:
                 "client_id": self.client_id,
                 "status": "active",
                 "ip_address": self.local_ip,
-                "port": self.client_port
+                "port": self.client_port,
+                "websocket_connected": self.ws_client.connected if self.ws_client else False
             })
     
     def start_client_server(self):
@@ -436,7 +589,6 @@ class FileManagerClient:
                 print(f"\nFile {filename} downloaded successfully to {file_path}")
                 print(f"File size: {downloaded} bytes")
                 
-                # Уведомляем Discovery Server о загрузке файла
                 self.notify_discovery_about_file_upload(filename, downloaded)
                 
                 return True
@@ -467,23 +619,123 @@ class FileManagerClient:
         except Exception as e:
             print(f"Error notifying Discovery Server: {e}")
     
+    def start_websocket_thread(self):
+        def run_websocket():
+            try:
+                self.ws_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.ws_loop)
+                self.ws_thread_running = True
+                
+                self.ws_loop.run_until_complete(self.start_websocket_connection())
+                if self.ws_task:
+                    self.ws_loop.run_until_complete(self.ws_task)
+            except Exception as e:
+                print(f"WebSocket thread error: {e}")
+            finally:
+                self.ws_thread_running = False
+                if self.ws_loop:
+                    self.ws_loop.close()
+        
+        ws_thread = threading.Thread(target=run_websocket)
+        ws_thread.daemon = True
+        ws_thread.start()
+        time.sleep(2)
+    
+    async def start_websocket_connection(self):
+        discovery_host = self.discovery_server_url.replace('http://', '').replace('https://', '')
+        if ':8000' in discovery_host:
+            ws_host = discovery_host.replace(':8000', ':8001')
+        else:
+            ws_host = f"{discovery_host}:8001"
+        
+        ws_url = f"ws://{ws_host}"
+        print(f"Connecting to WebSocket: {ws_url}")
+        
+        self.ws_client = WebSocketClient(self.client_id, ws_url)
+        
+        try:
+            if await self.ws_client.connect():
+                print("WebSocket connection established")
+                self.ws_task = asyncio.create_task(self.ws_client.listen_messages())
+                asyncio.create_task(self.websocket_heartbeat())
+                return True
+            else:
+                print("Failed to establish WebSocket connection")
+                return False
+        except Exception as e:
+            print(f"WebSocket connection error: {e}")
+            return False
+    
+    async def websocket_heartbeat(self):
+        while self.ws_client and self.ws_client.connected:
+            await self.ws_client.send_message('heartbeat', {})
+            await asyncio.sleep(30)
+    
+    def send_websocket_message_sync(self, message_type: str, data: dict):
+        if self.ws_client and self.ws_client.connected and self.ws_thread_running:
+            try:
+                if self.ws_loop and not self.ws_loop.is_closed():
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.ws_client.send_message(message_type, data),
+                        self.ws_loop
+                    )
+                    future.result(timeout=5)
+                    return True
+            except Exception as e:
+                print(f"Error sending WebSocket message: {e}")
+        return False
+    
+    def disconnect_websocket_sync(self):
+        if self.ws_client and self.ws_thread_running:
+            try:
+                if self.ws_loop and not self.ws_loop.is_closed():
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.ws_client.disconnect(),
+                        self.ws_loop
+                    )
+                    future.result(timeout=5)
+            except Exception as e:
+                print(f"Error disconnecting WebSocket: {e}")
+    
     def run_interactive(self):
         print("\n" + "="*50)
-        print("DISTRIBUTED FILE MANAGER CLIENT WITH P2P")
+        print("DISTRIBUTED FILE MANAGER WITH REAL-TIME CHAT")
         print("="*50)
+        
+        # Пытаемся подключиться к WebSocket
+        try:
+            self.start_websocket_thread()
+            time.sleep(3)
+            
+            if not (self.ws_client and self.ws_client.connected):
+                print("WebSocket connection failed - continuing without real-time chat")
+                self.ws_client = None
+        except Exception as e:
+            print(f"WebSocket initialization failed: {e}")
+            self.ws_client = None
         
         while True:
             print("\nOptions:")
             print("1. List all files from servers")
             print("2. Download file from server")
-            print("3. Show available clients")
-            print("4. Request file from another client")
-            print("5. Show my received files")
-            print("6. Show pending notifications")
-            print("7. Toggle auto-request files")
-            print("8. Exit")
             
-            choice = input("\nChoose option: ").strip()
+            if self.ws_client and self.ws_client.connected:
+                print("3. Send chat message")
+                print("4. Send private message")
+                print("5. Show chat history")
+                print("6. Show room clients")
+                print("7. Share downloaded file")
+            else:
+                print("3-7. Chat features unavailable (WebSocket not connected)")
+            
+            print("8. Show available clients")
+            print("9. Request file from another client")
+            print("10. Show my received files")
+            print("11. Show pending notifications")
+            print("12. Toggle auto-request files")
+            print("13. Exit")
+            
+            choice = input("\n>>> ").strip()
             
             if choice == "1":
                 files = self.get_all_files()
@@ -514,11 +766,114 @@ class FileManagerClient:
                         
                         if server_info:
                             filename = selected_file.get('filename')
-                            self.download_file(filename, server_info)
+                            if self.download_file(filename, server_info):
+                                if self.ws_client and self.ws_client.connected:
+                                    self.send_websocket_message_sync(
+                                        'file_share',
+                                        {'filename': filename, 'file_size': selected_file.get('file_size', 0)}
+                                    )
                 except ValueError:
                     print("Invalid input")
             
             elif choice == "3":
+                if not (self.ws_client and self.ws_client.connected):
+                    print("Chat features require WebSocket connection")
+                    continue
+                    
+                message = input("Enter message: ").strip()
+                if message:
+                    success = self.send_websocket_message_sync('chat_message', {'message': message})
+                    if not success:
+                        print("Failed to send message")
+                else:
+                    print("Empty message")
+            
+            elif choice == "4":
+                if not (self.ws_client and self.ws_client.connected):
+                    print("Chat features require WebSocket connection")
+                    continue
+                    
+                if self.ws_client.room_clients:
+                    print("Available clients:")
+                    for i, client_id in enumerate(self.ws_client.room_clients, 1):
+                        if client_id != self.client_id:
+                            print(f"{i}. {client_id[:8]}...")
+                    
+                    try:
+                        client_index = int(input("Select client: ")) - 1
+                        other_clients = [c for c in self.ws_client.room_clients if c != self.client_id]
+                        
+                        if 0 <= client_index < len(other_clients):
+                            target_id = other_clients[client_index]
+                            message = input("Enter private message: ").strip()
+                            
+                            if message:
+                                self.send_websocket_message_sync(
+                                    'private_message',
+                                    {'target_id': target_id, 'message': message}
+                                )
+                    except ValueError:
+                        print("Invalid input")
+                else:
+                    print("No other clients available")
+            
+            elif choice == "5":
+                if not (self.ws_client and self.ws_client.connected):
+                    print("Chat features require WebSocket connection")
+                    continue
+                    
+                if self.ws_client.chat_history:
+                    print("\nChat History:")
+                    for entry in self.ws_client.chat_history[-20:]:
+                        print(entry)
+                else:
+                    print("No chat history")
+            
+            elif choice == "6":
+                if not (self.ws_client and self.ws_client.connected):
+                    print("Chat features require WebSocket connection")
+                    continue
+                    
+                print(f"\nClients in room '{self.ws_client.room_id}':")
+                for client_id in self.ws_client.room_clients:
+                    status = "(you)" if client_id == self.client_id else ""
+                    print(f"- {client_id[:8]}... {status}")
+            
+            elif choice == "7":
+                if not (self.ws_client and self.ws_client.connected):
+                    print("Chat features require WebSocket connection")
+                    continue
+                    
+                downloads_dir = "./downloads"
+                if os.path.exists(downloads_dir):
+                    files = os.listdir(downloads_dir)
+                    if files:
+                        print("Downloaded files:")
+                        for i, file in enumerate(files, 1):
+                            file_path = os.path.join(downloads_dir, file)
+                            size = os.path.getsize(file_path)
+                            print(f"{i}. {file} ({size} bytes)")
+                        
+                        try:
+                            file_index = int(input("Select file to share: ")) - 1
+                            if 0 <= file_index < len(files):
+                                filename = files[file_index]
+                                file_path = os.path.join(downloads_dir, filename)
+                                file_size = os.path.getsize(file_path)
+                                
+                                self.send_websocket_message_sync(
+                                    'file_share',
+                                    {'filename': filename, 'file_size': file_size}
+                                )
+                                print(f"Shared {filename} with room")
+                        except ValueError:
+                            print("Invalid input")
+                    else:
+                        print("No downloaded files")
+                else:
+                    print("No downloads directory")
+            
+            elif choice == "8":
                 clients = self.get_available_clients()
                 if clients:
                     print(f"\nAvailable clients ({len(clients)}):")
@@ -527,7 +882,7 @@ class FileManagerClient:
                 else:
                     print("No other clients available")
             
-            elif choice == "4":
+            elif choice == "9":
                 clients = self.get_available_clients()
                 if not clients:
                     print("No other clients available")
@@ -548,7 +903,7 @@ class FileManagerClient:
                 except ValueError:
                     print("Invalid input")
             
-            elif choice == "5":
+            elif choice == "10":
                 received_dir = "./received_files"
                 if os.path.exists(received_dir):
                     files = os.listdir(received_dir)
@@ -563,7 +918,7 @@ class FileManagerClient:
                 else:
                     print("No received files directory")
             
-            elif choice == "6":
+            elif choice == "11":
                 if self.pending_notifications:
                     print(f"\nPending notifications ({len(self.pending_notifications)}):")
                     for i, notif in enumerate(self.pending_notifications, 1):
@@ -572,12 +927,14 @@ class FileManagerClient:
                 else:
                     print("No pending notifications")
             
-            elif choice == "7":
+            elif choice == "12":
                 self.auto_request_files = not self.auto_request_files
                 status = "enabled" if self.auto_request_files else "disabled"
                 print(f"Auto-request files: {status}")
             
-            elif choice == "8":
+            elif choice == "13":
+                if self.ws_client:
+                    self.disconnect_websocket_sync()
                 print("Goodbye!")
                 break
             

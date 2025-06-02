@@ -8,12 +8,92 @@ import os
 import requests
 import json
 from datetime import datetime, timedelta
+from typing import Dict, Set
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
 from shared.database import DatabaseManager
 from shared.protocols import Protocol, MessageType, ServerInfo
+
+class WebSocketHub:
+    def __init__(self):
+        self.connected_clients: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self.client_rooms: Dict[str, str] = {}
+        self.rooms: Dict[str, Set[str]] = {}
+    
+    async def register_client(self, websocket, client_id: str, room_id: str = "general"):
+        self.connected_clients[client_id] = websocket
+        self.client_rooms[client_id] = room_id
+        
+        if room_id not in self.rooms:
+            self.rooms[room_id] = set()
+        self.rooms[room_id].add(client_id)
+        
+        print(f"Client {client_id[:8]}... connected to room {room_id}")
+        
+        await self.broadcast_to_room(room_id, {
+            "type": "client_joined",
+            "client_id": client_id,
+            "room_id": room_id,
+            "timestamp": time.time()
+        }, exclude_client=client_id)
+    
+    async def unregister_client(self, client_id: str):
+        if client_id in self.connected_clients:
+            room_id = self.client_rooms.get(client_id)
+            
+            del self.connected_clients[client_id]
+            if client_id in self.client_rooms:
+                del self.client_rooms[client_id]
+            
+            if room_id and room_id in self.rooms:
+                self.rooms[room_id].discard(client_id)
+                if not self.rooms[room_id]:
+                    del self.rooms[room_id]
+                else:
+                    await self.broadcast_to_room(room_id, {
+                        "type": "client_left",
+                        "client_id": client_id,
+                        "room_id": room_id,
+                        "timestamp": time.time()
+                    })
+            
+            print(f"Client {client_id[:8]}... disconnected")
+    
+    async def broadcast_to_room(self, room_id: str, message: dict, exclude_client: str = None):
+        if room_id not in self.rooms:
+            return
+        
+        message_json = json.dumps(message)
+        disconnected_clients = []
+        
+        for client_id in self.rooms[room_id]:
+            if client_id == exclude_client:
+                continue
+                
+            if client_id in self.connected_clients:
+                try:
+                    await self.connected_clients[client_id].send(message_json)
+                except websockets.exceptions.ConnectionClosed:
+                    disconnected_clients.append(client_id)
+        
+        for client_id in disconnected_clients:
+            await self.unregister_client(client_id)
+    
+    async def send_to_client(self, client_id: str, message: dict):
+        if client_id in self.connected_clients:
+            try:
+                await self.connected_clients[client_id].send(json.dumps(message))
+                return True
+            except websockets.exceptions.ConnectionClosed:
+                await self.unregister_client(client_id)
+        return False
+    
+    def get_room_clients(self, room_id: str) -> list:
+        if room_id in self.rooms:
+            return list(self.rooms[room_id])
+        return []
 
 class DiscoveryServer:
     def __init__(self, port=8000, ws_port=8001, multicast_port=8002):
@@ -22,7 +102,7 @@ class DiscoveryServer:
         self.multicast_port = multicast_port
         self.db = DatabaseManager()
         self.app = Flask(__name__)
-        self.connected_clients = {}
+        self.websocket_hub = WebSocketHub()
         self.setup_routes()
         
         self.start_server_health_checker()
@@ -173,6 +253,7 @@ class DiscoveryServer:
                     "total_servers": server_count,
                     "active_servers": active_count,
                     "active_clients": client_count,
+                    "websocket_connections": len(self.websocket_hub.connected_clients),
                     "recent_servers": recent_servers,
                     "timestamp": datetime.now().isoformat()
                 })
@@ -219,6 +300,10 @@ class DiscoveryServer:
                         "file_servers": len(file_servers),
                         "clients": len(clients),
                         "discovery_servers": 1
+                    },
+                    "websocket": {
+                        "connected_clients": len(self.websocket_hub.connected_clients),
+                        "rooms": len(self.websocket_hub.rooms)
                     }
                 })
             except Exception as e:
@@ -416,74 +501,88 @@ class DiscoveryServer:
         print("Notification monitor started")
     
     async def websocket_handler(self, websocket, path):
-        client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        print(f"WebSocket connection from {client_id}")
-        
+        client_id = None
         try:
-            welcome_msg = {
-                "type": "welcome",
-                "message": "Connected to Discovery Server",
-                "timestamp": time.time()
-            }
-            await websocket.send(json.dumps(welcome_msg))
+            registration_msg = await websocket.recv()
+            registration_data = json.loads(registration_msg)
             
-            servers = self.db.get_active_servers()
-            servers_msg = {
-                "type": "servers_list",
-                "servers": servers,
-                "count": len(servers),
-                "timestamp": time.time()
-            }
-            await websocket.send(json.dumps(servers_msg))
+            client_id = registration_data.get('client_id')
+            room_id = registration_data.get('room_id', 'general')
+            
+            if not client_id:
+                await websocket.send(json.dumps({"error": "client_id required"}))
+                return
+            
+            await self.websocket_hub.register_client(websocket, client_id, room_id)
+            
+            await websocket.send(json.dumps({
+                "type": "registration_confirmed",
+                "client_id": client_id,
+                "room_id": room_id,
+                "room_clients": self.websocket_hub.get_room_clients(room_id)
+            }))
             
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    msg_type = data.get('type')
-                    print(f"WebSocket message from {client_id}: {msg_type}")
-                    
-                    if msg_type == 'heartbeat':
-                        server_id = data.get('server_id')
-                        if server_id:
-                            self.db.update_heartbeat(server_id)
-                            response = {
-                                "type": "heartbeat_ack",
-                                "server_id": server_id,
-                                "status": "ok",
-                                "timestamp": time.time()
-                            }
-                            await websocket.send(json.dumps(response))
-                    
-                    elif msg_type == 'get_servers':
-                        servers = self.db.get_active_servers()
-                        response = {
-                            "type": "servers_list",
-                            "servers": servers,
-                            "count": len(servers),
-                            "timestamp": time.time()
-                        }
-                        await websocket.send(json.dumps(response))
-                    
-                    elif msg_type == 'subscribe_updates':
-                        response = {
-                            "type": "subscription_confirmed",
-                            "message": "Subscribed to server updates",
-                            "timestamp": time.time()
-                        }
-                        await websocket.send(json.dumps(response))
-                        
+                    await self.handle_websocket_message(client_id, data)
                 except json.JSONDecodeError:
-                    error_msg = {
-                        "type": "error",
-                        "message": "Invalid JSON format",
-                        "timestamp": time.time()
-                    }
-                    await websocket.send(json.dumps(error_msg))
+                    await websocket.send(json.dumps({"error": "Invalid JSON"}))
                     
         except websockets.exceptions.ConnectionClosed:
-            print(f"WebSocket connection closed: {client_id}")
+            print(f"WebSocket connection closed for client {client_id}")
         except Exception as e:
-            print(f"WebSocket error for {client_id}: {e}")
+            print(f"WebSocket error: {e}")
+        finally:
+            if client_id:
+                await self.websocket_hub.unregister_client(client_id)
+    
+    async def handle_websocket_message(self, sender_id: str, data: dict):
+        message_type = data.get('type')
+        
+        if message_type == 'chat_message':
+            room_id = self.websocket_hub.client_rooms.get(sender_id, 'general')
+            await self.websocket_hub.broadcast_to_room(room_id, {
+                "type": "chat_message",
+                "sender_id": sender_id,
+                "message": data.get('message', ''),
+                "timestamp": time.time()
+            }, exclude_client=sender_id)
+        
+        elif message_type == 'private_message':
+            target_id = data.get('target_id')
+            if target_id:
+                await self.websocket_hub.send_to_client(target_id, {
+                    "type": "private_message",
+                    "sender_id": sender_id,
+                    "message": data.get('message', ''),
+                    "timestamp": time.time()
+                })
+        
+        elif message_type == 'file_share':
+            room_id = self.websocket_hub.client_rooms.get(sender_id, 'general')
+            await self.websocket_hub.broadcast_to_room(room_id, {
+                "type": "file_available",
+                "sender_id": sender_id,
+                "filename": data.get('filename', ''),
+                "file_size": data.get('file_size', 0),
+                "timestamp": time.time()
+            }, exclude_client=sender_id)
+        
+        elif message_type == 'heartbeat':
+            await self.websocket_hub.send_to_client(sender_id, {
+                "type": "heartbeat_ack",
+                "timestamp": time.time()
+            })
+        
+        elif message_type == 'get_room_clients':
+            room_id = self.websocket_hub.client_rooms.get(sender_id, 'general')
+            clients = self.websocket_hub.get_room_clients(room_id)
+            await self.websocket_hub.send_to_client(sender_id, {
+                "type": "room_clients",
+                "room_id": room_id,
+                "clients": clients
+            })
     
     def start_multicast_listener(self):
         try:
